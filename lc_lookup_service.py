@@ -233,6 +233,7 @@ class Search:
     def __init__(self):
         self.started = time.time()
         self.tried = []
+        self.errors = []          # server-side problems seen during this search
         self.answered = False
 
     def time_left(self):
@@ -254,12 +255,24 @@ class Search:
 
 
 def sru_records(search, template, query):
+    """List of records ([] = the server answered: nothing found). None = the server failed or
+    answered with an error such as 'System temporarily unavailable' (that is NOT 'no record')."""
     data = search.get(template.format(query=urllib.parse.quote(query, safe="")))
     if data is None:
         return None
     try:
-        return marc_records(data)
+        recs = marc_records(data)
+        if recs:
+            return recs
+        root = ET.fromstring(data)
+        diags = [e for e in root.iter() if local(e.tag) == "diagnostic"]
+        if diags:
+            msg = " ".join((e.text or "").strip() for d in diags for e in d.iter() if local(e.tag) == "message")
+            search.errors.append(msg.strip() or "server error")
+            return None
+        return []
     except ET.ParseError:
+        search.errors.append("unreadable answer")
         return None
 
 
@@ -275,8 +288,14 @@ def find_in_sru(search, name, template, query_templates, variants, wanted, isbn1
             for rec in recs:
                 if record_isbns(rec) & wanted:
                     return record_to_json(rec, isbn13, name)
-    search.note("%s: %s" % (name, "not reachable" if failed and failed == len(variants) * len(query_templates)
-                            else "no record for this ISBN"))
+    total = len(variants) * len(query_templates)
+    if failed == total:
+        why = "temporarily unavailable or not reachable"
+    elif failed:
+        why = "no record found (some searches failed, so this may be incomplete)"
+    else:
+        why = "no record for this ISBN"
+    search.note("%s: %s" % (name, why))
     return None
 
 
@@ -358,7 +377,9 @@ def lookup(isbn13):
                 break
         search.note("Library of Congress by LCCN: " + (
             ("found via LCCN " + result["lccn"]) if result
-            else ("no record for LCCN " + ", ".join(lccns[:3])) if lccns else "no LCCN known for this ISBN"))
+            else ("could not read the record for LCCN " + ", ".join(lccns[:3]) + " (Library of Congress unavailable?)")
+            if (lccns and search.errors) else ("no record for LCCN " + ", ".join(lccns[:3])) if lccns
+            else "no LCCN known for this ISBN"))
 
     # 3) other libraries
     if not result:
@@ -372,8 +393,11 @@ def lookup(isbn13):
             raise RuntimeError("no catalogue server could be reached")
         result = {"found": False, "isbn": isbn13}
     result["tried"] = search.tried
+    if search.errors and not result["found"]:
+        result["unavailable"] = sorted(set(search.errors))
 
-    ttl = HIT_SECONDS if result["found"] else MISS_SECONDS
+    # a "not found" is only remembered when every search really answered; after a server error try again next time
+    ttl = HIT_SECONDS if result["found"] else (30 if search.errors else MISS_SECONDS)
     with _cache_lock:
         _cache[isbn13] = (now + ttl, result)
     return result
